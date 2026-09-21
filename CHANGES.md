@@ -1,5 +1,14 @@
 # Change Log
 
+## Unreleased
+
+### Stable style
+
+- Fix `# fmt: skip` placed on a line that ends with an opening bracket (such as a
+  `def`, `class`, or `from ... import (` header). The frozen region is now extended
+  to the matching closing bracket instead of splicing code into the comment,
+  dropping statement content, or raising an internal error
+
 ## Version 26.5.1
 
 ### Stable style

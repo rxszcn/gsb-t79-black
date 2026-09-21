@@ -636,6 +636,13 @@ def _get_compound_statement_header(
                 header_leaves.append(child)
         else:
             header_leaves.extend(child.leaves())
+
+    # Special case for `async_stmt` where the ASYNC token is on the
+    # grandparent node.
+    async_token = compound_stmt.prev_sibling
+    if async_token is not None and async_token.type == token.ASYNC:
+        header_leaves.insert(0, async_token)
+
     return header_leaves
 
 
@@ -650,10 +657,118 @@ def _find_closest_previous_sibling(node: LN) -> LN | None:
     return None
 
 
+def _following_leaf(node: LN) -> Leaf | None:
+    """Return the first leaf that follows `node`, if any."""
+    current: LN | None = node
+    while current is not None:
+        next_sibling = current.next_sibling
+        if next_sibling is not None:
+            if isinstance(next_sibling, Leaf):
+                return next_sibling
+            return first_leaf_of(next_sibling)
+        current = current.parent
+    return None
+
+
+def _bracket_imbalance(nodes: list[LN]) -> int:
+    """Return unclosed opening brackets minus unopened closing brackets."""
+    imbalance = 0
+    for node in nodes:
+        if isinstance(node, Node):
+            leaves: Iterator[Leaf] = node.leaves()
+        else:
+            leaves = iter((node,))
+        for node_leaf in leaves:
+            if node_leaf.type in OPENING_BRACKETS:
+                imbalance += 1
+            elif node_leaf.type in CLOSING_BRACKETS:
+                imbalance -= 1
+    return imbalance
+
+
+def _close_fmt_skip_region(ignored_nodes: list[LN]) -> list[LN]:
+    """Extend `ignored_nodes` so the frozen region never splits a bracket pair.
+
+    `# fmt: skip` freezes the physical line it is placed on.  When that line
+    ends with an opening bracket (or begins with a closing one), freezing only
+    the line itself would cut a bracket pair in half, leaving the remainder to
+    be reformatted or spliced into the comment.  Grow the region leaf by leaf
+    until every bracket inside it is balanced.
+    """
+    imbalance = _bracket_imbalance(ignored_nodes)
+    if imbalance > 0:
+        next_leaf = _following_leaf(ignored_nodes[-1])
+        while next_leaf is not None and imbalance > 0:
+            if next_leaf.type == token.ENDMARKER:
+                break
+            ignored_nodes = [*ignored_nodes, next_leaf]
+            if next_leaf.type in OPENING_BRACKETS:
+                imbalance += 1
+            elif next_leaf.type in CLOSING_BRACKETS:
+                imbalance -= 1
+            next_leaf = _following_leaf(next_leaf)
+    elif imbalance < 0:
+        prev_leaf = preceding_leaf(ignored_nodes[0])
+        while prev_leaf is not None and imbalance < 0:
+            ignored_nodes = [prev_leaf, *ignored_nodes]
+            if prev_leaf.type in OPENING_BRACKETS:
+                imbalance += 1
+            elif prev_leaf.type in CLOSING_BRACKETS:
+                imbalance -= 1
+            prev_leaf = preceding_leaf(prev_leaf)
+
+    # If the region ends right before the colon that terminates a compound
+    # statement header, freeze the colon as well so the header is not left
+    # dangling.
+    next_leaf = _following_leaf(ignored_nodes[-1])
+    if (
+        next_leaf is not None
+        and next_leaf.type == token.COLON
+        and next_leaf.next_sibling is not None
+        and next_leaf.next_sibling.type == syms.suite
+    ):
+        ignored_nodes = [*ignored_nodes, next_leaf]
+
+    return ignored_nodes
+
+
+def _merge_ignored_subtrees(ignored_nodes: list[LN]) -> list[LN]:
+    """Merge ignored nodes into the largest possible subtrees.
+
+    If every child of a node is ignored, ignore the node itself instead, so
+    no hollowed-out containers are left behind for the line generator to trip
+    over.  The string form of the frozen region is unchanged.
+    """
+    merged = list(ignored_nodes)
+    while True:
+        merged_ids = {id(node) for node in merged}
+        for node in merged:
+            parent = node.parent
+            if parent is None or id(parent) in merged_ids:
+                continue
+            children = parent.children
+            if not children or any(id(child) not in merged_ids for child in children):
+                continue
+            first_index = next(
+                i for i, child in enumerate(merged) if child is children[0]
+            )
+            merged[first_index : first_index + len(children)] = [parent]
+            break
+        else:
+            return merged
+
+
 def _generate_ignored_nodes_from_fmt_skip(
     leaf: Leaf, comment: ProtoComment, mode: Mode
 ) -> Iterator[LN]:
-    """Generate all leaves that should be ignored by the `# fmt: skip` from `leaf`."""
+    """Generate all leaves that should be ignored by the `# fmt: skip` from `leaf`.
+
+    The frozen region is decided by a single rule: the comment freezes the
+    physical line it is placed on.  If the comment ends a statement or a
+    compound statement header, the whole statement or header is frozen.
+    Either way, the region is then extended as needed so that it never cuts
+    through a bracket pair.
+    """
     prev_sibling = leaf.prev_sibling
     parent = leaf.parent
     ignored_nodes: list[LN] = []
@@ -785,6 +900,12 @@ def _generate_ignored_nodes_from_fmt_skip(
                 header_nodes = _get_compound_statement_header(body_node, parent)
                 if header_nodes:
                     ignored_nodes = header_nodes + ignored_nodes
+
+        # The frozen region must not cut through a bracket pair: a
+        # `# fmt: skip` on a line that ends with an opening bracket freezes
+        # everything up to the matching closing bracket as well.
+        ignored_nodes = _close_fmt_skip_region(ignored_nodes)
+        ignored_nodes = _merge_ignored_subtrees(ignored_nodes)
 
         leaf_is_ignored = any(
             ignored is leaf
