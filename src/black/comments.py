@@ -636,6 +636,16 @@ def _get_compound_statement_header(
                 header_leaves.append(child)
         else:
             header_leaves.extend(child.leaves())
+
+    # Special case for `async_stmt` where the ASYNC token is on the
+    # grandparent node.
+    if (
+        compound_stmt.parent is not None
+        and compound_stmt.parent.type == syms.async_stmt
+        and compound_stmt.prev_sibling is not None
+        and compound_stmt.prev_sibling.type == token.ASYNC
+    ):
+        header_leaves.insert(0, compound_stmt.prev_sibling)
     return header_leaves
 
 
@@ -648,6 +658,74 @@ def _find_closest_previous_sibling(node: LN) -> LN | None:
             return prev_sibling
         current = current.parent
     return None
+
+
+def _bracket_pair_nodes(open_leaf: Leaf) -> list[LN] | None:
+    """Return the nodes spanning the bracket pair opened by `open_leaf`.
+
+    A `# fmt: skip` comment on a line ending with an opening bracket freezes
+    the whole bracket pair, no matter what kind of node the brackets belong
+    to (an atom, a def's parameters, class bases, an import list, ...).
+    Freezing only the opening bracket would leave the rest of the pair to be
+    reformatted around it.
+
+    If the pair spans all children of the parent node, the parent itself is
+    returned so the node stays intact.
+    """
+    parent = open_leaf.parent
+    if parent is None:
+        return None
+    children = parent.children
+    try:
+        start = children.index(open_leaf)
+    except ValueError:
+        return None
+    depth = 0
+    for end in range(start, len(children)):
+        for child_leaf in children[end].leaves():
+            if child_leaf.type in OPENING_BRACKETS:
+                depth += 1
+            elif child_leaf.type in CLOSING_BRACKETS:
+                depth -= 1
+                if depth == 0:
+                    if start == 0 and end == len(children) - 1:
+                        return [parent]
+                    return list(children[start : end + 1])
+    return None
+
+
+def _lift_ignored_nodes(ignored_nodes: list[LN]) -> list[LN]:
+    """Replace fully ignored nodes with the node itself.
+
+    If every child of a node is ignored, ignoring the children individually
+    would leave a gutted node behind that trips up later visitors (e.g. an
+    empty `power` or `typevartuple` node).  Ignore the node as a whole
+    instead; the frozen text is identical either way.
+    """
+    nodes = list(ignored_nodes)
+    while True:
+        covered = {id(node) for node in nodes}
+        for node in nodes:
+            parent = node.parent
+            if (
+                parent is not None
+                and isinstance(parent, Node)
+                and parent.children
+                and id(parent) not in covered
+                and all(id(child) in covered for child in parent.children)
+            ):
+                first_index = min(
+                    index
+                    for index, child in enumerate(nodes)
+                    if child.parent is parent
+                )
+                nodes = [
+                    child for child in nodes if child.parent is not parent
+                ]
+                nodes.insert(first_index, parent)
+                break
+        else:
+            return nodes
 
 
 def _generate_ignored_nodes_from_fmt_skip(
@@ -710,15 +788,20 @@ def _generate_ignored_nodes_from_fmt_skip(
         # or NEWLINE leaves.
 
         current_node = prev_sibling
+        ignored_nodes = []
         if (
             isinstance(current_node, Leaf)
             and current_node.type in OPENING_BRACKETS
-            and current_node.parent
-            and current_node.parent.type == syms.atom
         ):
-            current_node = current_node.parent
+            # The comment is on a line that ends with an opening bracket.
+            # Freeze the entire bracket pair as a unit.
+            pair_nodes = _bracket_pair_nodes(current_node)
+            if pair_nodes is not None:
+                ignored_nodes = pair_nodes
+                current_node = pair_nodes[0]
 
-        ignored_nodes = [current_node]
+        if not ignored_nodes:
+            ignored_nodes = [current_node]
         if current_node.prev_sibling is None and current_node.parent is not None:
             current_node = current_node.parent
 
@@ -778,6 +861,32 @@ def _generate_ignored_nodes_from_fmt_skip(
             if current_node.prev_sibling is None and current_node.parent is not None:
                 current_node = current_node.parent
 
+        # If the frozen region is followed by the rest of a compound
+        # statement header (an optional return annotation and the colon),
+        # freeze through the colon as well.  The colon belongs to the
+        # header; leaving it behind would strand it on its own line for
+        # `async` statements, whose remaining children are visited after a
+        # line break, and a leftover annotation would get re-wrapped in
+        # parentheses by `visit_funcdef`.
+        if ignored_nodes:
+            header_tail: list[LN] = []
+            sibling = ignored_nodes[-1].next_sibling
+            while sibling is not None:
+                if (
+                    sibling.type == token.COLON
+                    and sibling.next_sibling is not None
+                    and sibling.next_sibling.type in (syms.suite, syms.simple_stmt)
+                ):
+                    ignored_nodes.extend(header_tail)
+                    ignored_nodes.append(sibling)
+                    break
+                if sibling.type in (token.NEWLINE, token.INDENT, token.DEDENT) or (
+                    isinstance(sibling, Node) and sibling.type == syms.suite
+                ):
+                    break
+                header_tail.append(sibling)
+                sibling = sibling.next_sibling
+
         # Special handling for compound statements with semicolon-separated bodies
         if isinstance(parent, Node):
             body_node = _find_compound_statement_context(parent)
@@ -797,7 +906,7 @@ def _generate_ignored_nodes_from_fmt_skip(
         if not leaf_is_ignored:
             leaf.prefix = leaf.prefix[comment.consumed :]
 
-        yield from ignored_nodes
+        yield from _lift_ignored_nodes(ignored_nodes)
 
 
 def is_fmt_on(container: LN, mode: Mode) -> bool:

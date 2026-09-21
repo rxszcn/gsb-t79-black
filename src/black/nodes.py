@@ -956,6 +956,23 @@ def is_async_stmt_or_funcdef(leaf: Leaf) -> bool:
     )
 
 
+def is_frozen_async_stmt_header(leaf: Leaf) -> bool:
+    """Return True if the leaf is a `# fmt: skip`-frozen async statement header.
+
+    When `# fmt: skip` freezes the header of an `async def`/`async for`/
+    `async with` statement, the frozen text (including the ASYNC token) is
+    inserted as a single STANDALONE_COMMENT leaf in place of the header.
+    Like the ASYNC leaf it replaces, it must not be treated as a complete
+    line: the rest of the statement (colon, body) still follows.
+    """
+    return bool(
+        leaf.type == STANDALONE_COMMENT
+        and getattr(leaf, "fmt_pass_converted_first_leaf", None) is not None
+        and leaf.parent
+        and leaf.parent.type in {syms.async_stmt, syms.async_funcdef}
+    )
+
+
 def is_type_comment(leaf: Leaf, mode: Mode) -> bool:
     """Return True if the given leaf is a type comment. This function should only
     be used for general type comments (excluding ignore annotations, which should

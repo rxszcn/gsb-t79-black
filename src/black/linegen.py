@@ -49,6 +49,7 @@ from black.nodes import (
     has_sibling_with_type,
     is_arith_like,
     is_async_stmt_or_funcdef,
+    is_frozen_async_stmt_header,
     is_atom_with_invisible_parens,
     is_docstring,
     is_empty_tuple,
@@ -267,7 +268,16 @@ class LineGenerator(Visitor[Line]):
 
     def visit_funcdef(self, node: Node) -> Iterator[Line]:
         """Visit function definition."""
-        yield from self.line()
+        # When the header was frozen by `# fmt: skip` (including the ASYNC
+        # token of an `async def`), the frozen text sits on the current line
+        # in place of the header.  Don't break the line here: the remaining
+        # children (a one-line body, or the suite's INDENT which emits the
+        # line itself) must follow on from it.
+        if not (
+            len(self.current_line.leaves) == 1
+            and is_frozen_async_stmt_header(self.current_line.leaves[0])
+        ):
+            yield from self.line()
 
         # Remove redundant brackets around return type annotation.
         is_return_annotation = False
